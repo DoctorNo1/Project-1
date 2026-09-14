@@ -3,24 +3,29 @@
 // What it does:
 //   * Captures the whole (multi-monitor) desktop once per minute.
 //   * Saves each capture as a timestamped PNG into  Documents\ScreenJournal.
+//   * Only captures during the time windows listed in  hours.txt  (if any).
+//   * Can start automatically when you log in (toggle from the tray menu).
 //   * Runs quietly in the background (no console window, nothing flashing).
 //
 // What it deliberately does NOT do:
 //   * It does not hide from the person using the computer. The process runs
-//     under its own name, is visible in Task Manager, and shows a tray icon
-//     with a right-click menu so the owner can always open the folder or quit.
+//     under its own name, is visible in Task Manager, autostart uses the normal
+//     HKCU\...\Run key (shown in Task Manager > Startup), and it shows a tray
+//     icon with a right-click menu so the owner can always find, pause or quit.
 //
 // This is meant to run on your OWN machine, with your knowledge, as a memory
 // aid / activity log. It is not a covert-monitoring tool and is intentionally
 // easy to find and stop.
 //
-// Build (Visual Studio Developer Command Prompt):
-//   cl /EHsc /O2 /DUNICODE /D_UNICODE screenjournal.cpp ^
-//      gdiplus.lib gdi32.lib user32.lib shell32.lib ole32.lib /link /SUBSYSTEM:WINDOWS
+// Build (Visual Studio Developer Command Prompt) — /utf-8 keeps the Ukrainian
+// menu text and hours.txt template correct:
+//   cl /utf-8 /EHsc /O2 /DUNICODE /D_UNICODE screenjournal.cpp ^
+//      gdiplus.lib gdi32.lib user32.lib shell32.lib ole32.lib advapi32.lib ^
+//      /link /SUBSYSTEM:WINDOWS
 //
 // Build (MinGW-w64):
 //   g++ -O2 -municode -mwindows screenjournal.cpp -o screenjournal.exe ^
-//       -lgdiplus -lgdi32 -luser32 -lshell32 -lole32
+//       -lgdiplus -lgdi32 -luser32 -lshell32 -lole32 -ladvapi32
 
 #ifndef UNICODE
 #define UNICODE
@@ -28,44 +33,65 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS   // allow sscanf / _wfopen without MSVC C4996
+#endif
 
 #include <windows.h>
 #include <shlobj.h>       // SHGetKnownFolderPath
 #include <gdiplus.h>
 #include <shellapi.h>     // Shell_NotifyIcon
 #include <string>
+#include <vector>
+#include <cstdio>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-static const UINT   kCaptureIntervalMs = 60 * 1000;   // once per minute
-static const wchar_t kFolderName[]      = L"ScreenJournal";
-static const wchar_t kWindowClass[]     = L"ScreenJournalHiddenWindow";
-static const wchar_t kAppTitle[]        = L"Screen Journal";
-static const wchar_t kMutexName[]       = L"ScreenJournal_SingleInstance_Mutex";
+static const UINT    kCaptureIntervalMs = 60 * 1000;   // once per minute
+static const wchar_t kFolderName[]       = L"ScreenJournal";
+static const wchar_t kHoursFileName[]    = L"hours.txt";
+static const wchar_t kWindowClass[]      = L"ScreenJournalHiddenWindow";
+static const wchar_t kAppTitle[]         = L"Screen Journal";
+static const wchar_t kMutexName[]        = L"ScreenJournal_SingleInstance_Mutex";
+
+// Registry autostart (per-user; visible in Task Manager > Startup).
+static const wchar_t kRunKey[]   = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t kRunValue[] = L"ScreenJournal";
 
 #define WM_TRAYICON   (WM_APP + 1)
 #define ID_TIMER      1
 #define IDM_OPEN      2001
 #define IDM_STATUS    2002
 #define IDM_EXIT      2003
+#define IDM_AUTOSTART 2004
+#define IDM_HOURS     2005
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 static NOTIFYICONDATA g_nid = {};
 static std::wstring    g_outputDir;
-static bool            g_capturing = true;
+static bool            g_capturing = true;   // master pause toggle
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Full path to this running executable.
+static std::wstring GetExePath()
+{
+    wchar_t buf[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    return buf;
+}
 
 // Resolve the encoder CLSID for a given MIME type (e.g. L"image/png").
 static bool GetEncoderClsid(const wchar_t* mimeType, CLSID* clsid)
@@ -111,6 +137,144 @@ static std::wstring ResolveOutputDir()
     CreateDirectoryW(dir.c_str(), nullptr);   // ignore "already exists"
     return dir;
 }
+
+static std::wstring HoursFilePath()
+{
+    return g_outputDir + L"\\" + kHoursFileName;
+}
+
+// ---------------------------------------------------------------------------
+// Active hours (read from hours.txt)
+// ---------------------------------------------------------------------------
+struct TimeRange { int start; int end; };   // minutes from midnight [start, end)
+
+// Parse one line like "08:00-12:00" into a range. Returns false if not a range.
+static bool ParseRange(const char* line, TimeRange* out)
+{
+    int sh, sm, eh, em;
+    if (sscanf(line, " %d:%d - %d:%d", &sh, &sm, &eh, &em) == 4) {
+        if (sh >= 0 && sh < 24 && sm >= 0 && sm < 60 &&
+            eh >= 0 && eh < 24 && em >= 0 && em < 60) {
+            out->start = sh * 60 + sm;
+            out->end   = eh * 60 + em;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Create a documented hours.txt the first time, so the user knows the format.
+static void EnsureHoursFile()
+{
+    std::wstring path = HoursFilePath();
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return;   // already exists — never overwrite the user's settings
+
+    FILE* f = _wfopen(path.c_str(), L"w");
+    if (!f)
+        return;
+    // UTF-8 BOM so Notepad shows the Ukrainian comments correctly.
+    fputs("\xEF\xBB\xBF"
+          "# Години, коли робити знімки екрана.\n"
+          "# Формат: HH:MM-HH:MM, один діапазон у рядку (24-годинний час).\n"
+          "# Рядки, що починаються з #, ігноруються.\n"
+          "# Якщо файл порожній або без коректних діапазонів — знімки цілий день.\n"
+          "# Діапазон через північ теж працює, напр. 22:00-06:00.\n"
+          "#\n"
+          "# Приклад (прибери # на початку рядка, щоб увімкнути):\n"
+          "# 08:00-12:00\n"
+          "# 13:00-17:00\n",
+          f);
+    fclose(f);
+}
+
+// Is the current local time inside an active window?
+// No file / no valid ranges  ->  active all day.
+static bool IsWithinActiveHours()
+{
+    FILE* f = _wfopen(HoursFilePath().c_str(), L"r");
+    if (!f)
+        return true;
+
+    std::vector<TimeRange> ranges;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        const char* p = line;
+        // Skip a UTF-8 BOM if it survived on the first line.
+        if ((unsigned char)p[0] == 0xEF &&
+            (unsigned char)p[1] == 0xBB &&
+            (unsigned char)p[2] == 0xBF)
+            p += 3;
+        while (*p == ' ' || *p == '\t')
+            ++p;
+        if (*p == '#' || *p == '\r' || *p == '\n' || *p == '\0')
+            continue;
+        TimeRange r;
+        if (ParseRange(p, &r))
+            ranges.push_back(r);
+    }
+    fclose(f);
+
+    if (ranges.empty())
+        return true;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    const int now = st.wHour * 60 + st.wMinute;
+
+    for (const TimeRange& r : ranges) {
+        if (r.start == r.end)
+            continue;                       // empty range
+        if (r.start < r.end) {
+            if (now >= r.start && now < r.end)
+                return true;
+        } else {                            // range wraps past midnight
+            if (now >= r.start || now < r.end)
+                return true;
+        }
+    }
+    return false;
+}
+
+// Capture only when not paused AND inside the configured hours.
+static bool ShouldCaptureNow()
+{
+    return g_capturing && IsWithinActiveHours();
+}
+
+// ---------------------------------------------------------------------------
+// Autostart (HKCU\...\Run)
+// ---------------------------------------------------------------------------
+static bool IsAutostartEnabled()
+{
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return false;
+    LONG rc = RegQueryValueExW(key, kRunValue, nullptr, nullptr, nullptr, nullptr);
+    RegCloseKey(key);
+    return rc == ERROR_SUCCESS;
+}
+
+static void SetAutostart(bool enable)
+{
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS)
+        return;
+
+    if (enable) {
+        std::wstring cmd = L"\"" + GetExePath() + L"\"";
+        RegSetValueExW(key, kRunValue, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(cmd.c_str()),
+                       static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(key, kRunValue);
+    }
+    RegCloseKey(key);
+}
+
+// ---------------------------------------------------------------------------
+// Screenshot
+// ---------------------------------------------------------------------------
 
 // Timestamped file name: screen_YYYY-MM-DD_HH-MM-SS.png
 static std::wstring MakeFilePath()
@@ -187,10 +351,13 @@ static void ShowTrayMenu(HWND hwnd)
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (g_capturing ? MF_CHECKED : 0),
                 IDM_STATUS, L"Знімки екрана активні");
+    AppendMenuW(menu, MF_STRING | (IsAutostartEnabled() ? MF_CHECKED : 0),
+                IDM_AUTOSTART, L"Запускати при вході в систему");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_OPEN, L"Відкрити папку зі знімками");
+    AppendMenuW(menu, MF_STRING, IDM_OPEN,  L"Відкрити папку зі знімками");
+    AppendMenuW(menu, MF_STRING, IDM_HOURS, L"Змінити години (hours.txt)");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Вихід");
+    AppendMenuW(menu, MF_STRING, IDM_EXIT,  L"Вихід");
 
     // Required so the menu closes correctly when clicking elsewhere.
     SetForegroundWindow(hwnd);
@@ -207,11 +374,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CREATE:
         AddTrayIcon(hwnd);
         SetTimer(hwnd, ID_TIMER, kCaptureIntervalMs, nullptr);
-        CaptureScreen();   // take an initial shot right away
+        if (ShouldCaptureNow())
+            CaptureScreen();   // take an initial shot if we're inside active hours
         return 0;
 
     case WM_TIMER:
-        if (wParam == ID_TIMER && g_capturing)
+        if (wParam == ID_TIMER && ShouldCaptureNow())
             CaptureScreen();
         return 0;
 
@@ -230,8 +398,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                      : L"Screen Journal — призупинено");
             Shell_NotifyIcon(NIM_MODIFY, &g_nid);
             break;
+        case IDM_AUTOSTART:
+            SetAutostart(!IsAutostartEnabled());
+            break;
         case IDM_OPEN:
             ShellExecuteW(hwnd, L"open", g_outputDir.c_str(),
+                          nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case IDM_HOURS:
+            EnsureHoursFile();   // make sure it exists before opening
+            ShellExecuteW(hwnd, L"open", HoursFilePath().c_str(),
                           nullptr, nullptr, SW_SHOWNORMAL);
             break;
         case IDM_EXIT:
@@ -270,6 +446,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
         return 1;
 
     g_outputDir = ResolveOutputDir();
+    EnsureHoursFile();   // create a documented template on first run
 
     // Register a message-only-ish hidden window (no visible window is created,
     // but the tray icon keeps the app fully discoverable and controllable).
